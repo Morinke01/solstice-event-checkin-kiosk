@@ -1,4 +1,7 @@
-"""Simulated synchronous badge-printer vendor REST API."""
+"""DEPRECATED Day 3 synchronous badge-printer REST simulation.
+
+The Day 4 runtime uses ``run_vendor_worker.py`` and RabbitMQ instead.
+"""
 
 from __future__ import annotations
 

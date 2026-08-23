@@ -1,4 +1,4 @@
-"""HTTP API and small browser kiosk for the synchronous baseline."""
+"""HTTP API and browser kiosk for the asynchronous Day 4 workflow."""
 
 from __future__ import annotations
 
@@ -7,8 +7,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from .attendees import AttendeeStore
-from .checkin import AttendeeNotFoundError, CheckInService
-from .printer_client import PrinterError
+from .checkin import AttendeeNotFoundError
+from .queue import QueuePublishError
+from .webhook import SIGNATURE_HEADER, WebhookService
 
 
 KIOSK_HTML = """<!doctype html>
@@ -33,13 +34,14 @@ KIOSK_HTML = """<!doctype html>
     .attendee { display: flex; justify-content: space-between; gap: 16px; padding: 16px; background: #0a1727; border-radius: 12px; }
     .status { font-weight: 800; color: #ffd166; }
     .status.checked { color: #59e3b3; }
+    .status.pending { color: #73b7ff; }
   </style>
 </head>
 <body>
 <main>
   <p class="subtitle">SOLSTICE EVENTS CO. · STAFF KIOSK</p>
   <h1>Conference check-in</h1>
-  <p class="subtitle">Enter an attendee code to print one badge and complete check-in.</p>
+  <p class="subtitle">Scan once. Badge printing completes asynchronously.</p>
   <section class="panel">
     <form id="scan-form" class="scan">
       <input id="attendee-id" aria-label="Attendee ID" placeholder="Try SOL-001" required>
@@ -52,35 +54,45 @@ KIOSK_HTML = """<!doctype html>
 <script>
   const list = document.querySelector('#attendees');
   const result = document.querySelector('#result');
+  let activeAttendeeId = null;
   async function refresh() {
     const response = await fetch('/api/attendees');
     const data = await response.json();
     list.innerHTML = data.attendees.map(a => `
       <div class="attendee">
         <span><strong>${a.name}</strong><br>${a.attendee_id}</span>
-        <span class="status ${a.status === 'CHECKED_IN' ? 'checked' : ''}">${a.status}</span>
+        <span class="status ${a.status === 'CHECKED_IN' ? 'checked' : a.status === 'PENDING' ? 'pending' : ''}">${a.status}</span>
       </div>`).join('');
+    const activeAttendee = data.attendees.find(a => a.attendee_id === activeAttendeeId);
+    if (activeAttendee?.status === 'CHECKED_IN' && result.dataset.waiting === 'true') {
+      result.textContent = 'Badge printed successfully. Attendee is checked in.';
+      result.dataset.waiting = 'false';
+    }
   }
   document.querySelector('#scan-form').addEventListener('submit', async event => {
     event.preventDefault();
-    result.textContent = 'Waiting for badge printer…';
+    result.textContent = 'Sending badge request…';
     const attendeeId = document.querySelector('#attendee-id').value.trim();
+    activeAttendeeId = attendeeId;
+    result.dataset.waiting = 'false';
     const response = await fetch('/api/scan', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({attendee_id: attendeeId})
     });
     const data = await response.json();
     result.textContent = data.message || data.error;
+    result.dataset.waiting = String(data.attendee?.status === 'PENDING');
     await refresh();
   });
   refresh();
+  setInterval(refresh, 1000);
 </script>
 </body>
 </html>
 """
 
 
-def create_handler(store: AttendeeStore, check_in: CheckInService):
+def create_handler(store: AttendeeStore, check_in, webhook: WebhookService):
     class KioskHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             path = urlparse(self.path).path
@@ -88,7 +100,7 @@ def create_handler(store: AttendeeStore, check_in: CheckInService):
                 self._send_html(200, KIOSK_HTML)
                 return
             if path == "/health":
-                self._send_json(200, {"status": "ok", "print_mode": "synchronous"})
+                self._send_json(200, {"status": "ok", "print_mode": "asynchronous"})
                 return
             if path == "/api/attendees":
                 self._send_json(200, {"attendees": store.list_attendees()})
@@ -104,7 +116,11 @@ def create_handler(store: AttendeeStore, check_in: CheckInService):
             self._send_json(404, {"error": "endpoint not found"})
 
         def do_POST(self) -> None:
-            if urlparse(self.path).path != "/api/scan":
+            path = urlparse(self.path).path
+            if path == "/webhooks/badge-printed":
+                self._handle_webhook()
+                return
+            if path != "/api/scan":
                 self._send_json(404, {"error": "endpoint not found"})
                 return
 
@@ -125,8 +141,34 @@ def create_handler(store: AttendeeStore, check_in: CheckInService):
             except AttendeeNotFoundError as error:
                 self._send_json(404, {"error": str(error)})
                 return
-            except PrinterError as error:
+            except QueuePublishError as error:
                 self._send_json(503, {"error": str(error)})
+                return
+
+            self._send_json(202 if result["queued"] else 200, result)
+
+        def _handle_webhook(self) -> None:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                payload = json.loads(body)
+            except (ValueError, json.JSONDecodeError):
+                self._send_json(400, {"error": "valid JSON body is required"})
+                return
+
+            required = ("event_id", "attendee_id", "print_job_id")
+            if any(not isinstance(payload.get(field), str) for field in required):
+                self._send_json(422, {"error": "webhook payload is incomplete"})
+                return
+
+            try:
+                result = webhook.process(
+                    body,
+                    self.headers.get(SIGNATURE_HEADER, ""),
+                    payload,
+                )
+            except PermissionError as error:
+                self._send_json(401, {"error": str(error)})
                 return
 
             self._send_json(200, result)
@@ -155,8 +197,9 @@ def create_handler(store: AttendeeStore, check_in: CheckInService):
 
 def create_server(
     store: AttendeeStore,
-    check_in: CheckInService,
+    check_in,
+    webhook: WebhookService,
     host: str,
     port: int,
 ) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), create_handler(store, check_in))
+    return ThreadingHTTPServer((host, port), create_handler(store, check_in, webhook))

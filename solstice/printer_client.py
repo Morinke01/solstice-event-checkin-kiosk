@@ -1,4 +1,7 @@
-"""Synchronous REST client for the original badge-printer vendor API."""
+"""DEPRECATED Day 3 synchronous printer client retained as audit evidence.
+
+The Day 4 runtime publishes with ``RabbitMQPrintPublisher`` instead.
+"""
 
 from __future__ import annotations
 
